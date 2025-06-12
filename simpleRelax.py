@@ -199,15 +199,14 @@ def avoidance_setup(ego_agent, PI):
     ego_agent.A_eps, ego_agent.b_eps, ego_agent.c_eps = None, None, None
 
     # Predict collisions
-    # predict_collision(ego_agent, PI)
-    # # If there are collisions, create constraints
-    # for j in ego_agent.OMEGA: 
-    #     get_quadratic_collision_constraints(ego_agent,
-    #                                                                    PI[int(j), ego_agent.kc])
-
-    # For now always assume collision
-    ego_agent.kc = 0
-    get_quadratic_collision_constraints(ego_agent, PI[int(1), ego_agent.kc])
+    if ego_agent._K == 1:
+        ego_agent.kc = 0
+        get_quadratic_collision_constraints(ego_agent, PI[int(1), ego_agent.kc])
+    else:
+        predict_collision(ego_agent, PI)
+        # If there are collisions, create constraints
+        for j in ego_agent.OMEGA: 
+            get_quadratic_collision_constraints(ego_agent, PI[int(j), ego_agent.kc])
         
     return
 
@@ -244,7 +243,6 @@ def predict_collision(ego_agent, PI):
                 if j not in OMEGA:
                     OMEGA = np.hstack((OMEGA, int(j)))
 
-
     ego_agent.kc = kc
     ego_agent.OMEGA = OMEGA
     return
@@ -276,14 +274,7 @@ def get_quadratic_collision_constraints(ego_agent, p_j):
 
 ################################################################################
 def solve_sdp(agent):
-    ######### Problem Set-up ##########
-    # Get quadratic constraint coefficients
-    # for j in range(self.num_neighbours):
-    #     p_j = self.PI_prev[int(self.OMEGA[j]), self.kc, :]
-    #     A_eps, b_eps, c_eps = self.get_quadratic_constraints(p_j)
-
     # Problem Dimensions
-    inf = 0.0                     # dummy value for infinite values
     n = 3*agent._K
 
     A_in = agent.A_in
@@ -449,6 +440,7 @@ def main():
                 TRAJ[j, k, :] = PI[j, k-1, :]
 
     plot_horizon(0, agent, TRAJ)
+    agent0_history = agent[0].X_0[0:3]
 
     ##### MAIN LOOP #####
     for i in range(100):
@@ -489,11 +481,11 @@ def main():
         plot_horizon(0, agent, TRAJ)
 
         ### Update Initial Conditions / Step environment
-        # agent[0].X_0[0:3] = TRAJ[0, 1, :]
         agent[0].step(u_SDP[:3], dt=0.02)
+        agent0_history = np.vstack((agent0_history, agent[0].X_0[0:3]))
         print(f"otherPosition: {TRAJ[0, 1, :]}")
 
-    exit()
+    # play_horizon(agent0_history, agent)
 
     return 0
 
@@ -552,6 +544,44 @@ def plot_horizon(ID, agents, TRAJ):
             print('#' * 2*terminal_width)
             print()
             return 0
+
+#################################################################################
+def play_horizon(history, agents):
+    ### Plots #####################
+    fig, axes = plt.subplots(1, figsize=(12,12))
+    colours = ['r', 'b', 'g', 'orange', 'm']
+    lightColours = ['pink', 'lightblue', 'lightgreen', 'yellow']
+
+    metadata = {'title': 'MPC Animation', 'artist': 'Nathan', 'comment': 'See the associated params.urdf file for details'}
+    writer = FFMpegWriter(fps=20, metadata=metadata)
+
+    mp4_name = "temp.mp4"
+
+
+    # Save the animation
+    with writer.saving(fig, mp4_name, dpi=100):
+        for i in range(0, int(history.shape[0]), 1):
+
+            axes.plot(history[:i, 0], history[:i, 1], f'o-', color=f'{colours[0]}', markersize=8, label=f"UAV{i}") # Agent Trajectory
+            axes.plot(agents[0].P_DES[0], agents[0].P_DES[1], f'D', markersize=10, color=f'{colours[0]}')          # Goal
+
+            axes.plot(agents[1].X_0[0], agents[1].X_0[1], 'o', color=f'{colours[1]}')
+            neighbourhood_i = patches.Circle((agents[1].X_0[0], agents[1].X_0[1]), agents[1].neighbourhood,
+                                             edgecolor=f'{colours[1]}', facecolor='none', linewidth=2)                                           # neighbourhood
+            axes.add_patch(neighbourhood_i)
+
+            axes.axis("equal")
+            axes.grid(True)
+            axes.set_xlabel('X [m]')
+            axes.set_ylabel('Y [m]')
+            axes.set_title(f"Output")
+            # axes.legend()
+            plt.tight_layout()
+            
+
+            writer.grab_frame()
+            plt.pause(0.1)
+
 
 if __name__ == "__main__":
     main()
