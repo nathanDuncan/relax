@@ -35,7 +35,7 @@ class Agent():
         self.X_0 = config['X_0'][ID]
         self.P_DES = config['P_DES'][ID]
 
-        self.acc_max = 10.0 #m/s^2
+        self.acc_max = 100.0 #m/s^2
 
         self.OMEGA = np.empty([0])            # List of potential colliding agents
         self.kc = -np.inf                     # Earliest predicted collision instance
@@ -46,7 +46,7 @@ class Agent():
 
         ##### WEIGHTS #########################################################################
         ### Weight ###
-        self.Q = np.diag([100, 100, 100])
+        self.Q = np.diag(config['Q'])
         self.Q_TILDE = np.diag([])
         for i in range(self._K):
             if i >= self._K-self._kappa:
@@ -84,11 +84,13 @@ class Agent():
 
         ### Elipsoid
         self.S_i = None
-
         self.A_eps = None
         self.b_eps = None
         self.c_eps = None
+
+        self.u_WARM = None # Warm initialization
     
+    ################################################################################
     def step(self, U, dt):
         A, B = get_agent_models(dt)
         X_next = A @ self.X_0 + B @ U
@@ -195,11 +197,14 @@ def avoidance_setup(ego_agent, PI):
     # Update P and q terms of objective
     simplest_setup(ego_agent)
 
+    # Use QP without ellipsoid constraint for warm initialization
+    ego_agent.u_WARM = solve_qp(2*ego_agent.P, ego_agent.q, G=ego_agent.A_in, h=ego_agent.b_in, solver='osqp', verbose=False)
+
     # Reset constraints
     ego_agent.A_eps, ego_agent.b_eps, ego_agent.c_eps = None, None, None
 
     # Predict collisions
-    if ego_agent._K == 1:
+    if ego_agent._K == 1 and xiEllipsoid(PI[0, 0, :], PI[1, 0, :], ego_agent.THETA_INV) < ego_agent.neighbourhood + 0.1:
         ego_agent.kc = 0
         get_quadratic_collision_constraints(ego_agent, PI[int(1), ego_agent.kc])
     else:
@@ -295,11 +300,11 @@ def solve_sdp(agent):
         u = M.variable("u", n, mf.Domain.unbounded())       # Vector u
 
         ### Objective: minimize 0.5 * Tr(P U) + q^T u
-        obj_no_reg = mf.Expr.add(mf.Expr.mul(0.5, mf.Expr.dot(agent.P, U)), mf.Expr.dot(agent.q.T, u))
-        trace_U = mf.Expr.add([U.index(i, i) for i in range(n)])
-        reg_term = mf.Expr.mul(lambda_reg, trace_U)
-
-        obj = mf.Expr.add(obj_no_reg, reg_term)
+        obj = mf.Expr.add(mf.Expr.mul(0.5, mf.Expr.dot(agent.P, U)), mf.Expr.dot(agent.q.T, u))
+        if A_eps is not None:
+            trace_U = mf.Expr.add([U.index(i, i) for i in range(n)])
+            reg_term = mf.Expr.mul(lambda_reg, trace_U)
+            obj = mf.Expr.add(obj, reg_term)
         M.objective("Minimize", mf.ObjectiveSense.Minimize, obj)
 
         ### Equality constraint
@@ -332,6 +337,15 @@ def solve_sdp(agent):
             M.constraint(f"Z_uT_match_{j}", mf.Expr.sub(Z.index(n, j), u.index(j)), mf.Domain.equalsTo(0.0))
         # Z[n, n] == 1
         M.constraint("Z_block4", Z.index(n, n), mf.Domain.equalsTo(1.0))
+
+        ### Warm initialization
+        if A_eps is not None:
+            u.setLevel(agent.u_WARM)                          # (n,)
+            U.setLevel(np.outer(agent.u_WARM, agent.u_WARM).flatten()) # (n,n) → (n^2,)
+            # Z.setLevel(np.block([
+            #     [np.outer(agent.u_WARM, u0), u0.reshape(-1,1)],
+            #     [u0.reshape(1,-1), np.array([[1.0]])]
+            # ]).flatten())
 
         ### Solve the problem
         M.solve()
@@ -412,23 +426,25 @@ def main():
         agent[i] = Agent(i, config)
 
     PI = np.zeros((config['num_agents'], config['K'], 3)) 
+    PI_history = []
 
     simplest_setup(agent[0])
 
     ##### SOLVE PROBLEM ###################################################################
     # Firstly use QP to generate an initial prediction
-    U_QP = solve_qp(2*agent[0].P, agent[0].q, G=agent[0].A_in, h=agent[0].b_in, solver='osqp', verbose=False)
+    u_WARM = solve_qp(2*agent[0].P, agent[0].q, G=agent[0].A_in, h=agent[0].b_in, solver='osqp', verbose=False)
     # Print Solution
     print(f"Solution QP:")
-    for i in range(0, len(U_QP), 3):
-        print(*U_QP[i:i+3])
+    for i in range(0, len(u_WARM), 3):
+        print(*u_WARM[i:i+3])
     # Compute State Horizon
-    POS_QP = agent[0].A_0 @ agent[0].X_0 + agent[0].LAMBDA @ U_QP
+    POS_QP = agent[0].A_0 @ agent[0].X_0 + agent[0].LAMBDA @ u_WARM
 
     ### Add Solution to Shared List
     for i in range(config['K']):
         PI[0, i, :] = POS_QP[3*i: 3*(i+1)] # Ego Agent
         PI[1, i, :] = agent[1].X_0[:3]     # Static agent
+
     print(f"\nPI: {PI}")
     # Traj is for plotting
     TRAJ = np.zeros((config['num_agents'], config['K']+1, 3))
@@ -438,12 +454,12 @@ def main():
                 TRAJ[j, k, :] = agent[j].X_0[0:3]
             else:
                 TRAJ[j, k, :] = PI[j, k-1, :]
-
-    plot_horizon(0, agent, TRAJ)
+    PI_history.append(np.copy(TRAJ))
+    # plot_horizon(0, agent, TRAJ)
     agent0_history = agent[0].X_0[0:3]
 
     ##### MAIN LOOP #####
-    for i in range(100):
+    for i in range(20):
     
         ### Setup Problem
         avoidance_setup(agent[0], PI)
@@ -468,6 +484,7 @@ def main():
         for i in range(config['K']):
             PI[0, i, :] = POS_SDP[3*i: 3*(i+1)] # Ego Agent
             PI[1, i, :] = agent[1].X_0[:3]      # Static agent
+        
         print(f"\nPI: {PI}")
         # Traj is for plotting
         TRAJ = np.zeros((config['num_agents'], config['K']+1, 3))
@@ -478,14 +495,21 @@ def main():
                 else:
                     TRAJ[j, k, :] = PI[j, k-1, :]
 
-        plot_horizon(0, agent, TRAJ)
+        PI_history.append(np.copy(TRAJ))
+
+        # plot_horizon(0, agent, TRAJ)
 
         ### Update Initial Conditions / Step environment
-        agent[0].step(u_SDP[:3], dt=0.02)
+        agent[0].step(u_SDP[:3], dt=agent[0]._h/1.0)
         agent0_history = np.vstack((agent0_history, agent[0].X_0[0:3]))
         print(f"otherPosition: {TRAJ[0, 1, :]}")
 
-    # play_horizon(agent0_history, agent)
+    PI_history = np.array(PI_history)  # Shape: (time_steps, num_agents, K, 3)
+    print("\n\n#####################################\n")
+    print(PI_history.shape)
+    print(PI_history)
+
+    play_horizon(agent0_history, agent, PI_history)
 
     return 0
 
@@ -546,23 +570,27 @@ def plot_horizon(ID, agents, TRAJ):
             return 0
 
 #################################################################################
-def play_horizon(history, agents):
+def play_horizon(history, agents, PI_history):
     ### Plots #####################
+    print("[INFO] Recording results to video...")
+
     fig, axes = plt.subplots(1, figsize=(12,12))
     colours = ['r', 'b', 'g', 'orange', 'm']
     lightColours = ['pink', 'lightblue', 'lightgreen', 'yellow']
 
     metadata = {'title': 'MPC Animation', 'artist': 'Nathan', 'comment': 'See the associated params.urdf file for details'}
-    writer = FFMpegWriter(fps=20, metadata=metadata)
+    writer = FFMpegWriter(fps=1, metadata=metadata)
 
-    mp4_name = "temp.mp4"
+    mp4_name = "SDP_Relaxation_Animation.mp4"
 
 
     # Save the animation
     with writer.saving(fig, mp4_name, dpi=100):
         for i in range(0, int(history.shape[0]), 1):
+            axes.cla()
 
-            axes.plot(history[:i, 0], history[:i, 1], f'o-', color=f'{colours[0]}', markersize=8, label=f"UAV{i}") # Agent Trajectory
+            axes.plot(PI_history[i, 0, :, 0], PI_history[i, 0, :, 1], 'X-', markersize=8, color=f'{lightColours[0]}')   # Trajectory
+            axes.plot(history[:i, 0], history[:i, 1], f'o-', color=f'{colours[0]}', markersize=8, label=f"UAV{0}") # Agent Trajectory
             axes.plot(agents[0].P_DES[0], agents[0].P_DES[1], f'D', markersize=10, color=f'{colours[0]}')          # Goal
 
             axes.plot(agents[1].X_0[0], agents[1].X_0[1], 'o', color=f'{colours[1]}')
@@ -580,8 +608,7 @@ def play_horizon(history, agents):
             
 
             writer.grab_frame()
-            plt.pause(0.1)
-
+            plt.pause(2)
 
 if __name__ == "__main__":
     main()
