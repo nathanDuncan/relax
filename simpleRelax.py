@@ -204,6 +204,7 @@ def avoidance_setup(ego_agent, PI):
     ego_agent.A_eps, ego_agent.b_eps, ego_agent.c_eps = None, None, None
 
     # Predict collisions
+    print("[INFO] Checking shared trajectories for collisions...")
     if ego_agent._K == 1 and xiEllipsoid(PI[0, 0, :], PI[1, 0, :], ego_agent.THETA_INV) < ego_agent.neighbourhood + 0.1:
         ego_agent.kc = 0
         get_quadratic_collision_constraints(ego_agent, PI[int(1), ego_agent.kc])
@@ -233,10 +234,10 @@ def predict_collision(ego_agent, PI):
             if xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV) < ego_agent.neighbourhood and j != ego_agent.ID:
                 print(f"{xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV)} < {ego_agent.neighbourhood}")
                 # A collision is predicted
-                print("COLLISION!!!!\nAgent " + str(ego_agent.ID) + " at position", PI[ego_agent.ID, k, :], 
-                              " and \nAgent" + str(j) + " at position", PI[j, k, :])
-                print(f"\nXi^2 = {(xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV))**2}")
-                print(f"p_i = {PI[ego_agent.ID, k, :]}, p_j = {PI[j, k, :]}")
+                print("!!!POTENTIAL COLLISION!!!!\n\tAgent_" + str(ego_agent.ID) + " at position", PI[ego_agent.ID, k, :], 
+                              " and \n\tAgent_" + str(j) + " at position", PI[j, k, :])
+                # print(f"\nXi^2 = {(xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV))**2}")
+                # print(f"p_i = {PI[ego_agent.ID, k, :]}, p_j = {PI[j, k, :]}")
                 if len(OMEGA) == 0:
                     # This is the first collision detected with an agent
                     kc = k - 1
@@ -279,6 +280,7 @@ def get_quadratic_collision_constraints(ego_agent, p_j):
 
 ################################################################################
 def solve_sdp(agent):
+    print("[INFO] Solving Semi-Definite Relaxation")
     # Problem Dimensions
     n = 3*agent._K
 
@@ -294,121 +296,167 @@ def solve_sdp(agent):
     lambda_reg = 0.005
     
     # Create the model
-    with mf.Model("SDP Relaxation with Ellipsoid") as M:
-        ### Decision variables
-        U = M.variable("U", [n, n], mf.Domain.inPSDCone())  # PSD matrix U
-        u = M.variable("u", n, mf.Domain.unbounded())       # Vector u
+    if True:
+        with mf.Model("SDP Relaxation with Ellipsoid") as M:
+            ### Decision variables
+            U = M.variable("U", [n, n], mf.Domain.inPSDCone())  # PSD matrix U
+            u = M.variable("u", n, mf.Domain.unbounded())       # Vector u
 
-        ### Objective: minimize 0.5 * Tr(P U) + q^T u
-        obj = mf.Expr.add(mf.Expr.mul(0.5, mf.Expr.dot(agent.P, U)), mf.Expr.dot(agent.q.T, u))
-        if A_eps is not None:
-            trace_U = mf.Expr.add([U.index(i, i) for i in range(n)])
-            reg_term = mf.Expr.mul(lambda_reg, trace_U)
-            obj = mf.Expr.add(obj, reg_term)
-        M.objective("Minimize", mf.ObjectiveSense.Minimize, obj)
+            ### Objective: minimize 0.5 * Tr(P U) + q^T u
+            obj = mf.Expr.add(mf.Expr.mul(0.5, mf.Expr.dot(agent.P, U)), mf.Expr.dot(agent.q.T, u))
+            if A_eps is not None:
+                trace_U = mf.Expr.add([U.index(i, i) for i in range(n)])
+                reg_term = mf.Expr.mul(lambda_reg, trace_U)
+                obj = mf.Expr.add(obj, reg_term)
+            M.objective("Minimize", mf.ObjectiveSense.Minimize, obj)
 
-        ### Equality constraint
-        if A_eq is not None and b_eq is not None:
-            M.constraint("Aeq_u_eq_beq", mf.Expr.sub(mf.Expr.mul(A_eq, u), b_eq), mf.Domain.equalsTo(0.0))
+            ### Equality constraint
+            if A_eq is not None and b_eq is not None:
+                M.constraint("Aeq_u_eq_beq", mf.Expr.sub(mf.Expr.mul(A_eq, u), b_eq), mf.Domain.equalsTo(0.0))
 
-        ### Inequality constraint
-        M.constraint("Ain_u_le_bin", mf.Expr.sub(mf.Expr.mul(A_in, u), b_in), mf.Domain.lessThan(0.0))
+            ### Inequality constraint
+            M.constraint("Ain_u_le_bin", mf.Expr.sub(mf.Expr.mul(A_in, u), b_in), mf.Domain.lessThan(0.0))
 
-        ### Ellipsoid-based safety constraint:
-        # Tr(A_eps * U) + 2 b_eps^T u + c_eps >= 0
-        if A_eps is not None:
-            ellipsoid_lhs = mf.Expr.add(
-                mf.Expr.add(mf.Expr.dot(A_eps.T, U), mf.Expr.mul(2.0, mf.Expr.dot(b_eps.T, u))),
-                c_eps
-            )
-            M.constraint("ellipsoid_safety", ellipsoid_lhs, mf.Domain.greaterThan(0.0))
+            ### Ellipsoid-based safety constraint:
+            # Tr(A_eps * U) + 2 b_eps^T u + c_eps >= 0
+            if A_eps is not None:
+                ellipsoid_lhs = mf.Expr.add(
+                    mf.Expr.add(mf.Expr.dot(A_eps.T, U), mf.Expr.mul(2.0, mf.Expr.dot(b_eps.T, u))),
+                    c_eps
+                )
+                M.constraint("ellipsoid_safety", ellipsoid_lhs, mf.Domain.greaterThan(0.0))
 
-        ### Schur complement matrix
-        Z = M.variable("Z", [n + 1, n + 1], mf.Domain.inPSDCone())
-        # Z[:n, :n] == U
-        for i in range(n):
+            ### Schur complement matrix
+            Z = M.variable("Z", [n + 1, n + 1], mf.Domain.inPSDCone())
+            # Z[:n, :n] == U
+            for i in range(n):
+                for j in range(n):
+                    M.constraint(f"Z_U_match_{i}_{j}", mf.Expr.sub(Z.index(i, j), U.index(i, j)), mf.Domain.equalsTo(0.0))
+            # Z[:n, n] == u
+            for i in range(n):
+                M.constraint(f"Z_u_match_{i}", mf.Expr.sub(Z.index(i, n), u.index(i)), mf.Domain.equalsTo(0.0))
+            # Z[n, :n] == u^T
             for j in range(n):
-                M.constraint(f"Z_U_match_{i}_{j}", mf.Expr.sub(Z.index(i, j), U.index(i, j)), mf.Domain.equalsTo(0.0))
-        # Z[:n, n] == u
-        for i in range(n):
-            M.constraint(f"Z_u_match_{i}", mf.Expr.sub(Z.index(i, n), u.index(i)), mf.Domain.equalsTo(0.0))
-        # Z[n, :n] == u^T
-        for j in range(n):
-            M.constraint(f"Z_uT_match_{j}", mf.Expr.sub(Z.index(n, j), u.index(j)), mf.Domain.equalsTo(0.0))
-        # Z[n, n] == 1
-        M.constraint("Z_block4", Z.index(n, n), mf.Domain.equalsTo(1.0))
+                M.constraint(f"Z_uT_match_{j}", mf.Expr.sub(Z.index(n, j), u.index(j)), mf.Domain.equalsTo(0.0))
+            # Z[n, n] == 1
+            M.constraint("Z_block4", Z.index(n, n), mf.Domain.equalsTo(1.0))
 
-        ### Warm initialization
-        if A_eps is not None:
+            ### Warm initialization
+            if A_eps is not None:
+                u.setLevel(agent.u_WARM)                          # (n,)
+                U.setLevel(np.outer(agent.u_WARM, agent.u_WARM).flatten()) # (n,n) → (n^2,)
+                # Z.setLevel(np.block([
+                #     [np.outer(agent.u_WARM, u0), u0.reshape(-1,1)],
+                #     [u0.reshape(1,-1), np.array([[1.0]])]
+                # ]).flatten())
+
+            ### Solve the problem
+            M.solve()
+
+            status = M.getProblemStatus(mf.SolutionType.Default)
+
+            if status in [mf.ProblemStatus.PrimalFeasible, mf.ProblemStatus.PrimalAndDualFeasible]:
+                try:
+                    U_val = U.level()
+                    U_val = U_val.reshape((3*agent._K, 3*agent._K))
+                    u_val = u.level()
+                    print("\n\n\n")
+                    # print(f"u:\n{u_val}")
+                    # print(f"uu^T:\n{u_val*u_val.T}")
+                    # print(f"U:\n{U_val}")
+                    rank = np.linalg.matrix_rank(U_val)
+                    print(f"rank: {rank}")
+                    print("\n\n\n")
+
+                    # # Reconstruct rank-1 matrix from u
+                    # u_outer = np.outer(u_val, u_val)
+                    # print(f"u_outer:\n{u_outer}")
+
+                    # # Compute the residual
+                    # residual = U_val - u_outer
+                    # # Frobenius norm of the difference
+                    # violation = np.linalg.norm(residual, ord='fro')
+                    # # Optional: relative error
+                    # relative_error = violation / np.linalg.norm(U_val, ord='fro')
+
+                    # print("||U - uuᵀ||_F =", violation)
+                    # print("Relative error:", relative_error)
+
+                    # print("\n\n\n")
+                    # Z = np.block([
+                    #             [U_val,          u_val.reshape(-1, 1)],
+                    #             [u_val.reshape(1, -1), np.array([[1.0]])]
+                    #         ])
+                    # is_symmetric = np.allclose(Z, Z.T, atol=1e-8)
+                    # print("Z is symmetric:", is_symmetric)
+                    # eigvals = np.linalg.eigvalsh(Z)  # Use eigvalsh for symmetric matrices
+                    # is_psd = np.all(eigvals >= -1e-8)  # tolerate small negative values due to numerical error
+
+                    # print("Eigenvalues of Z:", eigvals)
+                    # print("Z is positive semidefinite:", is_psd)
+
+                    return u_val, U_val
+                except mf.SolutionError:
+                    print("u is not accessible even though problem status is", status)
+                    exit()
+            elif status == mf.ProblemStatus.Unknown:
+                try:
+                    u_val = u.level(mf.SolutionType.Interior)
+                    print("Interior solution u:", u_val)
+                    return u_val
+                except:
+                    print("Interior solution not available.")
+                    exit()
+            else:
+                print("No usable solution. Status =", status)
+                exit()
+    else:
+        with mf.Model("Regular QP") as M:
+            ### Decision variables
+            u = M.variable("u", n, mf.Domain.unbounded())       # Vector u
+
+            ### Objective: minimize 0.5 * P u^2 + q^T u
+            obj = mf.Expr.add(mf.Expr.mul(0.5, mf.Expr.mul(u, agent.P, u)), mf.Expr.dot(agent.q.T, u))
+            M.objective("Minimize", mf.ObjectiveSense.Minimize, obj)
+
+            ### Equality constraint
+            if A_eq is not None and b_eq is not None:
+                M.constraint("Aeq_u_eq_beq", mf.Expr.sub(mf.Expr.mul(A_eq, u), b_eq), mf.Domain.equalsTo(0.0))
+
+            ### Inequality constraint
+            M.constraint("Ain_u_le_bin", mf.Expr.sub(mf.Expr.mul(A_in, u), b_in), mf.Domain.lessThan(0.0))
+
+            ### Warm initialization
             u.setLevel(agent.u_WARM)                          # (n,)
-            U.setLevel(np.outer(agent.u_WARM, agent.u_WARM).flatten()) # (n,n) → (n^2,)
-            # Z.setLevel(np.block([
-            #     [np.outer(agent.u_WARM, u0), u0.reshape(-1,1)],
-            #     [u0.reshape(1,-1), np.array([[1.0]])]
-            # ]).flatten())
 
-        ### Solve the problem
-        M.solve()
+            ### Solve the problem
+            M.solve()
 
-        status = M.getProblemStatus(mf.SolutionType.Default)
+            status = M.getProblemStatus(mf.SolutionType.Default)
 
-        if status in [mf.ProblemStatus.PrimalFeasible, mf.ProblemStatus.PrimalAndDualFeasible]:
-            try:
-                U_val = U.level()
-                U_val = U_val.reshape((3*agent._K, 3*agent._K))
-                u_val = u.level()
-                print("\n\n\n")
-                print(f"u:\n{u_val}")
-                print(f"uu^T:\n{u_val*u_val.T}")
-                print(f"U:\n{U_val}")
-                rank = np.linalg.matrix_rank(U_val)
-                print(f"rank: {rank}")
-                print("\n\n\n")
-
-                # Reconstruct rank-1 matrix from u
-                u_outer = np.outer(u_val, u_val)
-                print(f"u_outer:\n{u_outer}")
-
-                # Compute the residual
-                residual = U_val - u_outer
-
-                # Frobenius norm of the difference
-                violation = np.linalg.norm(residual, ord='fro')
-
-                # Optional: relative error
-                relative_error = violation / np.linalg.norm(U_val, ord='fro')
-
-                print("||U - uuᵀ||_F =", violation)
-                print("Relative error:", relative_error)
-
-                print("\n\n\n")
-                Z = np.block([
-                            [U_val,          u_val.reshape(-1, 1)],
-                            [u_val.reshape(1, -1), np.array([[1.0]])]
-                        ])
-                is_symmetric = np.allclose(Z, Z.T, atol=1e-8)
-                print("Z is symmetric:", is_symmetric)
-                eigvals = np.linalg.eigvalsh(Z)  # Use eigvalsh for symmetric matrices
-                is_psd = np.all(eigvals >= -1e-8)  # tolerate small negative values due to numerical error
-
-                print("Eigenvalues of Z:", eigvals)
-                print("Z is positive semidefinite:", is_psd)
-
-                return u_val, U_val
-            except mf.SolutionError:
-                print("u is not accessible even though problem status is", status)
+            if status in [mf.ProblemStatus.PrimalFeasible, mf.ProblemStatus.PrimalAndDualFeasible]:
+                try:
+                    u_val = u.level()
+                    U_val = None
+                    print("\n\n\n")
+                    print(f"u:\n{u_val}")
+                    print(f"uu^T:\n{u_val*u_val.T}")
+                    print("\n\n\n")
+                    return u_val, U_val
+                except mf.SolutionError:
+                    print("u is not accessible even though problem status is", status)
+                    exit()
+            elif status == mf.ProblemStatus.Unknown:
+                try:
+                    u_val = u.level(mf.SolutionType.Interior)
+                    print("Interior solution u:", u_val)
+                    return u_val
+                except:
+                    print("Interior solution not available.")
+                    exit()
+            else:
+                print("No usable solution. Status =", status)
                 exit()
-        elif status == mf.ProblemStatus.Unknown:
-            try:
-                u_val = u.level(mf.SolutionType.Interior)
-                print("Interior solution u:", u_val)
-                return u_val
-            except:
-                print("Interior solution not available.")
-                exit()
-        else:
-            print("No usable solution. Status =", status)
-            exit()
 
 ################################################################################
 def main():
@@ -442,8 +490,11 @@ def main():
 
     ### Add Solution to Shared List
     for i in range(config['K']):
-        PI[0, i, :] = POS_QP[3*i: 3*(i+1)] # Ego Agent
-        PI[1, i, :] = agent[1].X_0[:3]     # Static agent
+        for j in range(config['num_agents']):
+            if j == 0:
+                PI[j, i, :] = POS_QP[3*i: 3*(i+1)] # Ego Agent
+            else:
+                PI[j, i, :] = agent[j].X_0[:3]     # Static agent
 
     print(f"\nPI: {PI}")
     # Traj is for plotting
@@ -464,26 +515,32 @@ def main():
         ### Setup Problem
         avoidance_setup(agent[0], PI)
 
-        ### Solve with obstacles
-        u_SDP, U_SDP = solve_sdp(agent[0])
-        print("\n\n\n")
-        print(f"Solution SDP:")
-        for i in range(0, len(u_SDP), 3):
-            print(*u_SDP[i:i+3])
-        # dist = U_QP @ agent[0].A_eps @ U_QP + 2 * agent[0].b_eps @ U_QP + agent[0].c_eps
-        # print(f"dist:\n{dist}")
-        # dist_u = u_SDP @ agent[0].A_eps @ u_SDP + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
-        # print(f"dist_u:\n{dist_u}")
-        # dist_U = np.sum(agent[0].A_eps * U_SDP) + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
-        # print(f"dist_U:\n{dist_U}")
+        ### Solve 
+        if agent[0].A_eps is not None:
+            u_SDP, U_SDP = solve_sdp(agent[0])
+            print("\n\n\n")
+            print(f"Solution SDP:")
+            for i in range(0, len(u_SDP), 3):
+                print(*u_SDP[i:i+3])
+            # dist = U_QP @ agent[0].A_eps @ U_QP + 2 * agent[0].b_eps @ U_QP + agent[0].c_eps
+            # print(f"dist:\n{dist}")
+            # dist_u = u_SDP @ agent[0].A_eps @ u_SDP + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
+            # print(f"dist_u:\n{dist_u}")
+            # dist_U = np.sum(agent[0].A_eps * U_SDP) + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
+            # print(f"dist_U:\n{dist_U}")
+        else: 
+            u_SDP = agent[0].u_WARM
 
         # Compute State Horizon
         POS_SDP = agent[0].A_0 @ agent[0].X_0 + agent[0].LAMBDA @ u_SDP
 
         ### Add Solution to Shared List
         for i in range(config['K']):
-            PI[0, i, :] = POS_SDP[3*i: 3*(i+1)] # Ego Agent
-            PI[1, i, :] = agent[1].X_0[:3]      # Static agent
+            for j in range(config['num_agents']):
+                if j == 0:
+                    PI[0, i, :] = POS_SDP[3*i: 3*(i+1)] # Ego Agent
+                else:
+                    PI[j, i, :] = agent[j].X_0[:3]     # Static agent   
         
         print(f"\nPI: {PI}")
         # Traj is for plotting
@@ -505,12 +562,8 @@ def main():
         print(f"otherPosition: {TRAJ[0, 1, :]}")
 
     PI_history = np.array(PI_history)  # Shape: (time_steps, num_agents, K, 3)
-    print("\n\n#####################################\n")
-    print(PI_history.shape)
-    print(PI_history)
-
     play_horizon(agent0_history, agent, PI_history)
-
+    print("[INFO] Simulation Complete.")
     return 0
 
 #################################################################################
@@ -578,7 +631,7 @@ def play_horizon(history, agents, PI_history):
     colours = ['r', 'b', 'g', 'orange', 'm']
     lightColours = ['pink', 'lightblue', 'lightgreen', 'yellow']
 
-    metadata = {'title': 'MPC Animation', 'artist': 'Nathan', 'comment': 'See the associated params.urdf file for details'}
+    metadata = {'title': 'MPC Animation', 'artist': 'Nathan', 'comment': 'See the associated config.py file for details'}
     writer = FFMpegWriter(fps=1, metadata=metadata)
 
     mp4_name = "SDP_Relaxation_Animation.mp4"
@@ -589,14 +642,18 @@ def play_horizon(history, agents, PI_history):
         for i in range(0, int(history.shape[0]), 1):
             axes.cla()
 
-            axes.plot(PI_history[i, 0, :, 0], PI_history[i, 0, :, 1], 'X-', markersize=8, color=f'{lightColours[0]}')   # Trajectory
-            axes.plot(history[:i, 0], history[:i, 1], f'o-', color=f'{colours[0]}', markersize=8, label=f"UAV{0}") # Agent Trajectory
-            axes.plot(agents[0].P_DES[0], agents[0].P_DES[1], f'D', markersize=10, color=f'{colours[0]}')          # Goal
+            for agnt_idx in range(PI_history.shape[1]):
+                if agnt_idx == 0:
+                    axes.plot(PI_history[i, agnt_idx, :, 0], PI_history[i, agnt_idx, :, 1], 'X-', markersize=8, color=f'{lightColours[agnt_idx]}')   # Horizon
+                    # Bad code for history
+                    axes.plot(history[:i, 0], history[:i, 1], f'o-', color=f'{colours[agnt_idx]}', markersize=8, label=f"UAV{agnt_idx}") # Agent Trajectory
+                    axes.plot(agents[agnt_idx].P_DES[0], agents[agnt_idx].P_DES[1], f'D', markersize=10, color=f'{colours[agnt_idx]}')          # Goal
 
-            axes.plot(agents[1].X_0[0], agents[1].X_0[1], 'o', color=f'{colours[1]}')
-            neighbourhood_i = patches.Circle((agents[1].X_0[0], agents[1].X_0[1]), agents[1].neighbourhood,
-                                             edgecolor=f'{colours[1]}', facecolor='none', linewidth=2)                                           # neighbourhood
-            axes.add_patch(neighbourhood_i)
+                else:
+                    axes.plot(agents[agnt_idx].X_0[0], agents[agnt_idx].X_0[1], 'o', color=f'{colours[agnt_idx]}')
+                    neighbourhood_i = patches.Circle((agents[agnt_idx].X_0[0], agents[agnt_idx].X_0[1]), agents[agnt_idx].neighbourhood,
+                                                    edgecolor=f'{colours[agnt_idx]}', facecolor='none', linewidth=2)                                           # neighbourhood
+                    axes.add_patch(neighbourhood_i)
 
             axes.axis("equal")
             axes.grid(True)
