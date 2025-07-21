@@ -3,6 +3,7 @@ A simple test of SDP relaxation collision avoidance.
 """
 # Imports
 import os
+import time
 import importlib
 import numpy as np
 import mosek.fusion as mf
@@ -25,7 +26,8 @@ class Agent():
         self._K = config['K']
         self._h = config['h']
         self._kappa = config['kappa']
-        self.r_min = config['r_min']          # Physical Radius
+        self.r_min = config['r_min']           # Physical Radius
+        self.lambda_reg = config['lambda_reg'] # Rank Penalty Scalar
         a = 1
         self.neighbourhood = a * self.r_min     # Collision boundary for search
         self.THETA = np.diag(config['theta']) # Ellipsoid Axes Scale
@@ -293,7 +295,7 @@ def solve_sdp(agent):
     b_eps = agent.b_eps
     c_eps = agent.c_eps
 
-    lambda_reg = 0.005
+    lambda_reg = agent.lambda_reg
     
     # Create the model
     if True:
@@ -510,8 +512,9 @@ def main():
     agent0_history = agent[0].X_0[0:3]
 
     ##### MAIN LOOP #####
-    for i in range(20):
-    
+    num_steps = 60
+    for i in range(num_steps):
+        real_time_start = time.time()
         ### Setup Problem
         avoidance_setup(agent[0], PI)
 
@@ -561,9 +564,15 @@ def main():
         agent0_history = np.vstack((agent0_history, agent[0].X_0[0:3]))
         print(f"otherPosition: {TRAJ[0, 1, :]}")
 
+    ### Finish
+    real_time_end = time.time()
+    elapsed = real_time_end - real_time_start
+    print(f"\n\n\nSim time elapsed = {num_steps*agent[0]._h}, \nreal time elapsed = {elapsed:.3f} s, \nratio = {elapsed/agent[0]._h:.2f}x")
+
     PI_history = np.array(PI_history)  # Shape: (time_steps, num_agents, K, 3)
     play_horizon(agent0_history, agent, PI_history)
     print("[INFO] Simulation Complete.")
+    
     return 0
 
 #################################################################################
@@ -665,7 +674,7 @@ def play_horizon(history, agents, PI_history):
             
 
             writer.grab_frame()
-            plt.pause(2)
+            plt.pause(0.5)
 
 if __name__ == "__main__":
     main()
