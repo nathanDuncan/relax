@@ -8,6 +8,7 @@ import importlib
 import numpy as np
 import mosek.fusion as mf
 from qpsolvers import solve_qp
+from collections import defaultdict
 
 # Plots
 import matplotlib.pyplot as plt
@@ -16,6 +17,7 @@ from matplotlib.animation import FFMpegWriter
 
 # Global
 terminal_width = os.get_terminal_size().columns
+PRINTS = False
 
 class Agent():
     """
@@ -97,8 +99,7 @@ class Agent():
         A, B = get_agent_models(dt)
         X_next = A @ self.X_0 + B @ U
         self.X_0 = X_next
-        print(f"Next Position: {X_next}")
-
+        if PRINTS: print(f"Next Position: {X_next}")
         return
 
 ################################################################################
@@ -160,7 +161,7 @@ def get_model_prediction_matrices(K, A, B):
 ################################################################################
 def load_config_module(path):
     """Dynamically import a config module and return its config dict."""
-    print(f"Path: {path}")
+    if PRINTS: print(f"Path: {path}")
     try:
         module = importlib.import_module(path)
         return getattr(module, 'config', {})  # Expect each config module to have `config` dict
@@ -206,7 +207,7 @@ def avoidance_setup(ego_agent, PI):
     ego_agent.A_eps, ego_agent.b_eps, ego_agent.c_eps = None, None, None
 
     # Predict collisions
-    print("[INFO] Checking shared trajectories for collisions...")
+    if PRINTS: print("[INFO] Checking shared trajectories for collisions...")
     if ego_agent._K == 1 and xiEllipsoid(PI[0, 0, :], PI[1, 0, :], ego_agent.THETA_INV) < ego_agent.neighbourhood + 0.1:
         ego_agent.kc = 0
         get_quadratic_collision_constraints(ego_agent, PI[int(1), ego_agent.kc])
@@ -230,30 +231,39 @@ def predict_collision(ego_agent, PI):
     OMEGA = np.empty([0])            # List of potential colliding agents
     kc = -np.inf                     # Earliest predicted collision instance
 
+    collision_radius = ego_agent.neighbourhood/3
+    true_collisions = 0
+    true_neighbourhood_violations = 0
+    horizon_violations = 0
+
     ### Search for Agents within collision boundary ##################
     for k in range(K):
         for j in range(num_agents):
             if xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV) < ego_agent.neighbourhood and j != ego_agent.ID:
-                print(f"{xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV)} < {ego_agent.neighbourhood}")
+                if PRINTS: print(f"{xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV)} < {ego_agent.neighbourhood}")
                 # A collision is predicted
-                print("!!!POTENTIAL COLLISION!!!!\n\tAgent_" + str(ego_agent.ID) + " at position", PI[ego_agent.ID, k, :], 
-                              " and \n\tAgent_" + str(j) + " at position", PI[j, k, :])
-                # print(f"\nXi^2 = {(xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV))**2}")
-                # print(f"p_i = {PI[ego_agent.ID, k, :]}, p_j = {PI[j, k, :]}")
+                if PRINTS: 
+                    print("!!!POTENTIAL COLLISION!!!!\n\tAgent_" + str(ego_agent.ID) + " at position", PI[ego_agent.ID, k, :], 
+                          " and \n\tAgent_" + str(j) + " at position", PI[j, k, :])
                 if len(OMEGA) == 0:
                     # This is the first collision detected with an agent
                     kc = k - 1
                     #Edge case
-                    if kc == -1: kc == 0
-                    if k == 0:
+                    if k == 0 or kc == -1:
                         # Drone is already within the collision boundary
                         kc = 0
+                        if xiEllipsoid(PI[ego_agent.ID, k, :], PI[j, k, :], ego_agent.THETA_INV) < collision_radius:
+                            true_collisions = 1
+                        else:
+                            true_neighbourhood_violations = 1
+                    else:
+                        horizon_violations = 1
                 if j not in OMEGA:
                     OMEGA = np.hstack((OMEGA, int(j)))
 
     ego_agent.kc = kc
     ego_agent.OMEGA = OMEGA
-    return
+    return true_collisions, true_neighbourhood_violations, horizon_violations
 
 ################################################################################
 def xiEllipsoid(p_i, p_j, THETA_INV):
@@ -362,13 +372,14 @@ def solve_sdp(agent):
                     U_val = U.level()
                     U_val = U_val.reshape((3*agent._K, 3*agent._K))
                     u_val = u.level()
-                    print("\n\n\n")
-                    # print(f"u:\n{u_val}")
-                    # print(f"uu^T:\n{u_val*u_val.T}")
-                    # print(f"U:\n{U_val}")
                     rank = np.linalg.matrix_rank(U_val)
-                    print(f"rank: {rank}")
-                    print("\n\n\n")
+                    if PRINTS: 
+                        print("\n\n\n")
+                        # print(f"u:\n{u_val}")
+                        # print(f"uu^T:\n{u_val*u_val.T}")
+                        # print(f"U:\n{U_val}")
+                        print(f"rank: {rank}")
+                        print("\n\n\n")
 
                     # # Reconstruct rank-1 matrix from u
                     # u_outer = np.outer(u_val, u_val)
@@ -399,20 +410,20 @@ def solve_sdp(agent):
 
                     return u_val, U_val
                 except mf.SolutionError:
-                    print("u is not accessible even though problem status is", status)
+                    print("[INFO] u is not accessible even though problem status is", status)
                     exit()
             elif status == mf.ProblemStatus.Unknown:
                 try:
                     u_val = u.level(mf.SolutionType.Interior)
-                    print("Interior solution u:", u_val)
+                    print("[INFO] Interior solution u:", u_val)
                     return u_val
                 except:
-                    print("Interior solution not available.")
+                    print("[INFO] Interior solution not available.")
                     exit()
             else:
-                print("No usable solution. Status =", status)
+                print("[INFO] No usable solution. Status =", status)
                 exit()
-    else:
+    else: # Is this needed?
         with mf.Model("Regular QP") as M:
             ### Decision variables
             u = M.variable("u", n, mf.Domain.unbounded())       # Vector u
@@ -461,6 +472,15 @@ def solve_sdp(agent):
                 exit()
 
 ################################################################################
+def compute_violations(ego, obstacles, Traj):
+    """
+    Returns
+        critical_violations : two agents are within collision radius of each other
+        true_violations : agent is currently within the avoidance radius of an obstacle
+        horizon_violations : agent's horizon enters into the avoidance radius of an obstacle
+    """
+
+################################################################################
 def main():
     np.set_printoptions(threshold=np.inf)
     ##### LOAD CONFIGS ###################################################################
@@ -484,9 +504,9 @@ def main():
     # Firstly use QP to generate an initial prediction
     u_WARM = solve_qp(2*agent[0].P, agent[0].q, G=agent[0].A_in, h=agent[0].b_in, solver='osqp', verbose=False)
     # Print Solution
-    print(f"Solution QP:")
+    if PRINTS: print(f"Solution QP:")
     for i in range(0, len(u_WARM), 3):
-        print(*u_WARM[i:i+3])
+        if PRINTS: print(*u_WARM[i:i+3])
     # Compute State Horizon
     POS_QP = agent[0].A_0 @ agent[0].X_0 + agent[0].LAMBDA @ u_WARM
 
@@ -498,7 +518,7 @@ def main():
             else:
                 PI[j, i, :] = agent[j].X_0[:3]     # Static agent
 
-    print(f"\nPI: {PI}")
+    if PRINTS: print(f"\nPI: {PI}")
     # Traj is for plotting
     TRAJ = np.zeros((config['num_agents'], config['K']+1, 3))
     for k in range(config['K']+1):
@@ -511,20 +531,29 @@ def main():
     # plot_horizon(0, agent, TRAJ)
     agent0_history = agent[0].X_0[0:3]
 
+    # Performance Metrics
+    worst_solve_time = 0.0
+    solve_metrics = []
+    violations = []
+    # TODO Make a bar graph of solve times with average line and differnent colours for SDP vs QP
+
     ##### MAIN LOOP #####
     num_steps = 60
+    real_time_start = time.time()
     for i in range(num_steps):
-        real_time_start = time.time()
+        step_start_time = time.time()
         ### Setup Problem
         avoidance_setup(agent[0], PI)
 
         ### Solve 
         if agent[0].A_eps is not None:
+            solver = 'sdp'
             u_SDP, U_SDP = solve_sdp(agent[0])
-            print("\n\n\n")
-            print(f"Solution SDP:")
-            for i in range(0, len(u_SDP), 3):
-                print(*u_SDP[i:i+3])
+            if PRINTS: 
+                print("\n\n\n")
+                print(f"Solution SDP:")
+                for i in range(0, len(u_SDP), 3):
+                    print(*u_SDP[i:i+3])
             # dist = U_QP @ agent[0].A_eps @ U_QP + 2 * agent[0].b_eps @ U_QP + agent[0].c_eps
             # print(f"dist:\n{dist}")
             # dist_u = u_SDP @ agent[0].A_eps @ u_SDP + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
@@ -532,6 +561,8 @@ def main():
             # dist_U = np.sum(agent[0].A_eps * U_SDP) + 2 * agent[0].b_eps @ u_SDP + agent[0].c_eps
             # print(f"dist_U:\n{dist_U}")
         else: 
+            print("No collisions here")
+            solver='qp'
             u_SDP = agent[0].u_WARM
 
         # Compute State Horizon
@@ -545,7 +576,7 @@ def main():
                 else:
                     PI[j, i, :] = agent[j].X_0[:3]     # Static agent   
         
-        print(f"\nPI: {PI}")
+        if PRINTS: print(f"\nPI: {PI}")
         # Traj is for plotting
         TRAJ = np.zeros((config['num_agents'], config['K']+1, 3))
         for k in range(config['K']+1):
@@ -562,13 +593,44 @@ def main():
         ### Update Initial Conditions / Step environment
         agent[0].step(u_SDP[:3], dt=agent[0]._h/1.0)
         agent0_history = np.vstack((agent0_history, agent[0].X_0[0:3]))
-        print(f"otherPosition: {TRAJ[0, 1, :]}")
+        if PRINTS: print(f"otherPosition: {TRAJ[0, 1, :]}")
+
+        # Evaluation
+        true_collision, true_violation, horizon_violation = predict_collision(agent[0], PI)
+        safe_traj = 1 if (true_collision + true_violation + horizon_violation) == 0 else 0
+        violations.append([safe_traj, true_collision, true_violation, horizon_violation])
+        step_duration = time.time() - step_start_time
+        solve_metrics.append([solver, step_duration])
+        
 
     ### Finish
     real_time_end = time.time()
     elapsed = real_time_end - real_time_start
-    print(f"\n\n\nSim time elapsed = {num_steps*agent[0]._h}, \nreal time elapsed = {elapsed:.3f} s, \nratio = {elapsed/agent[0]._h:.2f}x")
+    # Extract only the numeric values
+    values = [v for _, v in solve_metrics]
+    # Find the largest value
+    worst_solve_time = max(values)
+    # Count Violations
+    violation_sums = [sum(col) for col in zip(*violations)]
 
+    output_title =  " Final Statistics "
+    dash_buffer = max(int((terminal_width-len(output_title))/2), 1)
+
+    print("\n\n\n")
+    print('-'*dash_buffer + output_title + '-'*dash_buffer)
+    print(f"    Sim time elapsed   = {num_steps*agent[0]._h} s")
+    print(f"    Real time elapsed  = {elapsed:.3f} s")
+    print(f"    Average solve time = {elapsed/num_steps} s (~{1/(elapsed/num_steps):.1f} Hz)")
+    print(f"    Slowest solve time = {worst_solve_time} s (~{(1/worst_solve_time):.1f} Hz)")
+    print()
+    print(f"        Safe Trajectories : {violation_sums[0]} ({(100*violation_sums[0]/num_steps):.1f}% of all generated trajectories)")
+    print(f"          True Collisions : {violation_sums[1]} ({(100*violation_sums[1]/num_steps):.1f}% of all generated trajectories)")
+    print(f" Neighbourhood Violations : {violation_sums[2]} ({(100*violation_sums[2]/num_steps):.1f}% of all generated trajectories)")
+    print(f"       Horizon Violations : {violation_sums[3]} ({(100*violation_sums[3]/num_steps):.1f}% of all generated trajectories)")
+    print('-'*terminal_width)
+
+
+    plot_solve_times(solve_metrics)
     PI_history = np.array(PI_history)  # Shape: (time_steps, num_agents, K, 3)
     play_horizon(agent0_history, agent, PI_history)
     print("[INFO] Simulation Complete.")
@@ -576,16 +638,62 @@ def main():
     return 0
 
 #################################################################################
+def plot_solve_times(solve_metrics):
+    # Create a figure with tight layout
+    fig, ax = plt.subplots(figsize=(10, 8), constrained_layout=True)
+
+    colours = {
+        "qp" : 'green',
+        "sdp" : 'red'
+    }
+
+    for i, data in enumerate(solve_metrics):
+        # Remove extra space
+        ax.margins(x=0)  # no horizontal padding
+        # Plot bars
+        color = colours[data[0]]
+        ax.bar(i, data[1], width=0.8, color=color)
+
+    # Collect values by label
+    values_by_label = defaultdict(list)
+    for label, val in solve_metrics:
+        values_by_label[label].append(val)
+        values_by_label['all'].append(val)
+
+    # Compute averages
+    averages = {label: np.mean(vals) for label, vals in values_by_label.items()}
+
+    labels = list(averages.keys())
+    avg_values = list(averages.values())
+    overall_avg = np.mean(avg_values)
+
+    ax.axhline(overall_avg, color='black', linestyle='--', linewidth=1.5, label=f'Overall Avg: {overall_avg:.4f}')
+
+
+    # ax.axhline(averages['all'], color='black', linestyle='--', linewidth=1.5, label=f'Avg: {averages['all']:.2f}')
+
+    # Remove extra space
+    ax.margins(x=0)  # no horizontal padding
+
+    # Add labels and title
+    ax.set_ylabel('Step_Duration')
+    ax.set_title('MPC Solve Times')
+
+    # Show the plot
+    plt.show()
+
+#################################################################################
 def plot_horizon(ID, agents, TRAJ):
             ### Extract Values ############
             # Terminal Header
             output_title = " Horizon Plot "
-            print("\n\n")
-            print('#' * 2*terminal_width)
-            print('#'*int((terminal_width-len(output_title))/2) + output_title + '#'*int((terminal_width-len(output_title))/2))
-            print('#' * 2*terminal_width)
+            if PRINTS: 
+                print("\n\n")
+                print('#' * 2*terminal_width)
+                print('#'*int((terminal_width-len(output_title))/2) + output_title + '#'*int((terminal_width-len(output_title))/2))
+                print('#' * 2*terminal_width)
 
-            print(TRAJ)
+                print(TRAJ)
 
             # Combine X_0 and PI
             ego_agent = agents[0]
@@ -626,9 +734,10 @@ def plot_horizon(ID, agents, TRAJ):
             plt.tight_layout()
             plt.show()
             
-            print()
-            print('#' * 2*terminal_width)
-            print()
+            if PRINTS: 
+                print()
+                print('#' * 2*terminal_width)
+                print()
             return 0
 
 #################################################################################
